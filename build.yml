@@ -1,0 +1,162 @@
+name: Build QuickMenu
+on:
+  workflow_dispatch:
+  push:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Toolchain
+        run: |
+          rustup update stable
+          rustup default stable
+          rustup target add aarch64-linux-android
+          cargo install cargo-ndk
+      - name: Get Horizon
+        run: git clone --depth 1 --branch android-port https://github.com/Rayan-XOO/horizon.git "$HOME/horizon"
+      - name: Install cargo-horizon-mod
+        run: cargo install --path "$HOME/horizon/crates/cargo-horizon-mod"
+      - name: Write the mod
+        run: |
+          mkdir -p "$HOME/mod/src"
+          cd "$HOME/mod"
+          cat > Cargo.toml <<EOF
+          [package]
+          name = "quickmenu"
+          version = "0.1.0"
+          edition = "2024"
+
+          [lib]
+          crate-type = ["cdylib"]
+
+          [dependencies]
+          horizon-native-abi = { path = "$HOME/horizon/crates/horizon-native-abi" }
+
+          [profile.release]
+          strip = true
+          panic = "unwind"
+          EOF
+          python3 - <<'PYEOF'
+          import json, os
+          src = json.load(open(os.path.expanduser('~/horizon/mods/hello-android/horizon-native.json')))
+          out = {"schema": 1, "id": "quickmenu", "version": "0.1.0", "game": src["game"], "horizon": src["horizon"], "mixins": src["mixins"]}
+          json.dump(out, open('horizon-native.json', 'w'), indent=2)
+          PYEOF
+          cat > src/lib.rs <<'RSEOF'
+          //! Quick Menu: press 0 to open/close a HUD menu.
+          //! Z = coordinates, X = compass, C = save waypoint, V = distance to waypoint.
+          //! (Number keys are avoided for items because they would also change the hotbar.)
+          use horizon_native_abi::{Host, NativeMod, State, export_mod};
+
+          struct QuickMenu {
+              open: bool,
+              show_coords: bool,
+              show_compass: bool,
+              show_waypoint: bool,
+              waypoint: Option<(f64, f64, f64)>,
+              last: (f64, f64, f64, f64), // x, y, z, yaw (updated every HUD frame)
+          }
+
+          fn direction(yaw: f64) -> &'static str {
+              let y = yaw.rem_euclid(360.0);
+              match ((y + 22.5) / 45.0) as i32 % 8 {
+                  0 => "South",
+                  1 => "South-West",
+                  2 => "West",
+                  3 => "North-West",
+                  4 => "North",
+                  5 => "North-East",
+                  6 => "East",
+                  _ => "South-East",
+              }
+          }
+
+          fn onoff(v: bool) -> &'static str {
+              if v { "ON" } else { "OFF" }
+          }
+
+          impl NativeMod for QuickMenu {
+              fn new(host: &mut Host) -> Self {
+                  host.log("QuickMenu loaded: press 0 in a world");
+                  QuickMenu {
+                      open: false,
+                      show_coords: false,
+                      show_compass: false,
+                      show_waypoint: false,
+                      waypoint: None,
+                      last: (0.0, 0.0, 0.0, 0.0),
+                  }
+              }
+
+              fn hud(&mut self, host: &mut Host, game: &State) {
+                  if !game.in_world {
+                      return;
+                  }
+                  let (x, y, z, yaw) = (game.x as f64, game.y as f64, game.z as f64, game.yaw as f64);
+                  self.last = (x, y, z, yaw);
+
+                  if self.open {
+                      host.hud_line("== Quick Menu (0 to close) ==", 0xFFFF55);
+                      host.hud_line(&format!("Z  Coordinates: {}", onoff(self.show_coords)), 0xFFFFFF);
+                      host.hud_line(&format!("X  Compass: {}", onoff(self.show_compass)), 0xFFFFFF);
+                      host.hud_line("C  Save waypoint here", 0xFFFFFF);
+                      host.hud_line(&format!("V  Waypoint distance: {}", onoff(self.show_waypoint)), 0xFFFFFF);
+                  }
+                  if self.show_coords {
+                      host.hud_line(&format!("XYZ {:.1} {:.1} {:.1}", x, y, z), 0x55FF55);
+                  }
+                  if self.show_compass {
+                      host.hud_line(&format!("Facing {}", direction(yaw)), 0x55FFFF);
+                  }
+                  if self.show_waypoint {
+                      match self.waypoint {
+                          Some((wx, wy, wz)) => {
+                              let d = ((x - wx).powi(2) + (y - wy).powi(2) + (z - wz).powi(2)).sqrt();
+                              host.hud_line(&format!("Waypoint: {:.0} blocks", d), 0xFFAA00);
+                          }
+                          None => host.hud_line("Waypoint: not set (press C)", 0xFFAA00),
+                      }
+                  }
+              }
+
+              fn key(&mut self, host: &mut Host, key: &str, pressed: bool) {
+                  if !pressed {
+                      return;
+                  }
+                  match key {
+                      "key.keyboard.0" => self.open = !self.open,
+                      "key.keyboard.z" if self.open => self.show_coords = !self.show_coords,
+                      "key.keyboard.x" if self.open => self.show_compass = !self.show_compass,
+                      "key.keyboard.v" if self.open => self.show_waypoint = !self.show_waypoint,
+                      "key.keyboard.c" if self.open => {
+                          let (x, y, z, _) = self.last;
+                          self.waypoint = Some((x, y, z));
+                          host.chat(&format!("Waypoint saved at {:.0} {:.0} {:.0}", x, y, z));
+                      }
+                      _ => {}
+                  }
+              }
+
+              fn command(&mut self, host: &mut Host, command: &str) -> bool {
+                  if command == "qm" {
+                      self.open = !self.open;
+                      host.chat("Quick Menu toggled");
+                      return true;
+                  }
+                  false
+              }
+          }
+
+          export_mod!(QuickMenu);
+          RSEOF
+      - name: Build .hnmod
+        run: |
+          export ANDROID_NDK_HOME="${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_ROOT}"
+          cd "$HOME/mod"
+          cargo horizon-mod android
+          ls -l target/horizon-mod
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: quickmenu-hnmod
+          path: ~/mod/target/horizon-mod/quickmenu.hnmod
